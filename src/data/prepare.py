@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -20,6 +20,7 @@ FEATURE_COLUMNS = [
 TARGET_COLUMN = "global_active_power"
 RAW_ZIP = Path("data/raw/individual+household+electric+power+consumption.zip")
 RAW_TXT = "household_power_consumption.txt"
+PROCESSED_CSV = Path("data/processed/daily_power.csv")
 RAW_COLUMNS = [
     "Global_active_power",
     "Global_reactive_power",
@@ -29,6 +30,24 @@ RAW_COLUMNS = [
     "Sub_metering_2",
     "Sub_metering_3",
 ]
+COLUMN_MAP = {
+    "Global_active_power": "global_active_power",
+    "Global_reactive_power": "global_reactive_power",
+    "Voltage": "voltage",
+    "Global_intensity": "global_intensity",
+    "Sub_metering_1": "sub_metering_1",
+    "Sub_metering_2": "sub_metering_2",
+    "Sub_metering_3": "sub_metering_3",
+}
+SUM_COLUMNS = [
+    "global_active_power",
+    "global_reactive_power",
+    "sub_metering_1",
+    "sub_metering_2",
+    "sub_metering_3",
+    "sub_metering_remainder",
+]
+MEAN_COLUMNS = ["voltage", "global_intensity"]
 
 
 @dataclass(frozen=True)
@@ -52,54 +71,142 @@ class StandardScaler:
         return [[(row[j] - self.mean_[j]) / self.scale_[j] for j in range(len(self.mean_))] for row in rows]
 
 
-def load_daily_power(raw_zip: Path = RAW_ZIP) -> list[dict[str, float]]:
-    daily: dict[str, dict[str, float]] = {}
-    counts: dict[str, int] = {}
+def _parse_float(value: str) -> float:
+    return math.nan if value in {"?", ""} else float(value)
+
+
+def _read_minute_rows(raw_zip: Path) -> tuple[list[dict[str, object]], dict[str, int]]:
+    rows: list[dict[str, object]] = []
+    raw_missing = 0
     with ZipFile(raw_zip) as zf, zf.open(RAW_TXT) as fp:
         text = (line.decode("utf-8") for line in fp)
         reader = csv.DictReader(text, delimiter=";")
-        for row in reader:
-            day = datetime.strptime(row["Date"], "%d/%m/%Y").strftime("%Y-%m-%d")
-            bucket = daily.setdefault(day, {col: 0.0 for col in RAW_COLUMNS})
-            valid = True
-            vals = {}
-            for col in RAW_COLUMNS:
-                if row[col] == "?":
-                    valid = False
-                    break
-                vals[col] = float(row[col])
-            if not valid:
+        for raw in reader:
+            dt = datetime.strptime(f"{raw['Date']} {raw['Time']}", "%d/%m/%Y %H:%M:%S")
+            row: dict[str, object] = {"datetime": dt}
+            for raw_col, out_col in COLUMN_MAP.items():
+                value = _parse_float(raw[raw_col])
+                if math.isnan(value):
+                    raw_missing += 1
+                row[out_col] = value
+            rows.append(row)
+    rows.sort(key=lambda r: r["datetime"])
+    return rows, {"raw_minute_rows": len(rows), "raw_missing_values": raw_missing}
+
+
+def _interpolate_minutes(rows: list[dict[str, object]]) -> tuple[list[dict[str, object]], dict[str, int]]:
+    if not rows:
+        raise ValueError("No raw minute rows found")
+
+    by_dt = {row["datetime"]: row for row in rows}
+    start = rows[0]["datetime"]
+    end = rows[-1]["datetime"]
+    total_minutes = int((end - start).total_seconds() // 60) + 1
+    complete: list[dict[str, object]] = []
+    for i in range(total_minutes):
+        dt = start + timedelta(minutes=i)
+        source = by_dt.get(dt, {})
+        row = {"datetime": dt}
+        for col in COLUMN_MAP.values():
+            row[col] = source.get(col, math.nan)
+        complete.append(row)
+
+    for col in COLUMN_MAP.values():
+        known = [i for i, row in enumerate(complete) if not math.isnan(row[col])]
+        if not known:
+            raise ValueError(f"Column {col} has no non-missing values")
+        first = known[0]
+        for i in range(0, first):
+            complete[i][col] = complete[first][col]
+        last = known[-1]
+        for i in range(last + 1, len(complete)):
+            complete[i][col] = complete[last][col]
+        for left, right in zip(known, known[1:]):
+            if right == left + 1:
                 continue
-            for col, val in vals.items():
-                bucket[col] += val
-            counts[day] = counts.get(day, 0) + 1
+            left_value = complete[left][col]
+            right_value = complete[right][col]
+            step = (right_value - left_value) / (right - left)
+            for i in range(left + 1, right):
+                complete[i][col] = left_value + step * (i - left)
+
+    remaining_nan = sum(
+        1 for row in complete for col in COLUMN_MAP.values() if math.isnan(row[col])
+    )
+    for row in complete:
+        row["sub_metering_remainder"] = (
+            row["global_active_power"] * 1000.0 / 60.0
+            - row["sub_metering_1"]
+            - row["sub_metering_2"]
+            - row["sub_metering_3"]
+        )
+    return complete, {"complete_minute_rows": len(complete), "remaining_nan_values": remaining_nan}
+
+
+def _aggregate_daily(minutes: list[dict[str, object]]) -> list[dict[str, float]]:
+    daily: dict[str, dict[str, float]] = {}
+    counts: dict[str, int] = {}
+    for row in minutes:
+        day = row["datetime"].strftime("%Y-%m-%d")
+        bucket = daily.setdefault(day, {col: 0.0 for col in FEATURE_COLUMNS})
+        for col in SUM_COLUMNS + MEAN_COLUMNS:
+            bucket[col] += row[col]
+        counts[day] = counts.get(day, 0) + 1
 
     rows: list[dict[str, float]] = []
     for day in sorted(daily):
-        raw = daily[day]
-        if counts.get(day, 0) == 0:
-            continue
-        gap = raw["Global_active_power"] * 1000.0 / 60.0 - raw["Sub_metering_1"] - raw["Sub_metering_2"] - raw["Sub_metering_3"]
+        bucket = daily[day]
+        count = counts[day]
         rows.append(
             {
                 "date": day,
-                "global_active_power": raw["Global_active_power"],
-                "global_reactive_power": raw["Global_reactive_power"],
-                "voltage": raw["Voltage"],
-                "global_intensity": raw["Global_intensity"],
-                "sub_metering_1": raw["Sub_metering_1"],
-                "sub_metering_2": raw["Sub_metering_2"],
-                "sub_metering_3": raw["Sub_metering_3"],
-                "sub_metering_remainder": gap,
+                "global_active_power": bucket["global_active_power"],
+                "global_reactive_power": bucket["global_reactive_power"],
+                "voltage": bucket["voltage"] / count,
+                "global_intensity": bucket["global_intensity"] / count,
+                "sub_metering_1": bucket["sub_metering_1"],
+                "sub_metering_2": bucket["sub_metering_2"],
+                "sub_metering_3": bucket["sub_metering_3"],
+                "sub_metering_remainder": bucket["sub_metering_remainder"],
             }
         )
+    return rows
+
+
+def write_daily_power(rows: list[dict[str, float]], output_csv: Path = PROCESSED_CSV) -> None:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=["date", *FEATURE_COLUMNS])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_daily_power(raw_zip: Path = RAW_ZIP, return_metadata: bool = False):
+    minute_rows, metadata = _read_minute_rows(raw_zip)
+    complete_minutes, complete_metadata = _interpolate_minutes(minute_rows)
+    metadata.update(complete_metadata)
+    rows = _aggregate_daily(complete_minutes)
+    write_daily_power(rows)
+    metadata.update(
+        {
+            "daily_start": rows[0]["date"],
+            "daily_end": rows[-1]["date"],
+            "daily_continuous": is_date_continuous(rows),
+            "daily_has_nan": has_nan(rows),
+        }
+    )
     if has_nan(rows):
         raise ValueError("NaN values found in daily data")
-    return rows
+    return (rows, metadata) if return_metadata else rows
 
 
 def has_nan(rows: list[dict[str, float]]) -> bool:
     return any(math.isnan(row[col]) for row in rows for col in FEATURE_COLUMNS)
+
+
+def is_date_continuous(rows: list[dict[str, float]]) -> bool:
+    dates = [datetime.strptime(row["date"], "%Y-%m-%d") for row in rows]
+    return all((right - left).days == 1 for left, right in zip(dates, dates[1:]))
 
 
 def chronological_split(rows: list[dict[str, float]], train_ratio: float = 0.7):
@@ -128,4 +235,5 @@ def scaled_daily_frames(rows: list[dict[str, float]]) -> dict[str, object]:
         "target_scaler": target_scaler,
         "feature_columns": FEATURE_COLUMNS,
         "target_column": TARGET_COLUMN,
+        "scaler_fit_period": (train_rows[0]["date"], train_rows[-1]["date"]),
     }
